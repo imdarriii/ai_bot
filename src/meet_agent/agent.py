@@ -329,7 +329,11 @@ class MeetAgent:
                         if text:
                             tasks.append(self.recall.send_chat_message(self.bot_id, text))
                         await asyncio.gather(*tasks)
-                        logger.info("Audio sent: %d KB MP3", len(pcm) // 1024)
+                        # Wait for audio to finish playing before sending next
+                        # MP3 at 64kbps: duration = size_bytes * 8 / 64000
+                        duration = len(pcm) * 8 / 64000
+                        await asyncio.sleep(duration)
+                        logger.info("Audio sent: %d KB MP3 (%.1fs)", len(pcm) // 1024, duration)
                         if text:
                             logger.info("Chat sent: %s", text[:80])
                             self._chat_history.append({"sender": "Alex (bot)", "text": text})
@@ -943,19 +947,32 @@ TRANSCRIPT:
             print("=" * 50)
             print()
 
-            # 4b. Wait for admit
+            # 4b. Wait for admit (max 3 min, then give up)
             logger.info("Waiting for bot to be admitted...")
+            admitted = False
             for _ in range(180):
                 try:
                     bot_info = await self.recall.get_bot(self.bot_id)
                     status = bot_info.latest_status or ""
                     if "in_call" in status.lower():
                         self._admitted = True
+                        admitted = True
                         logger.info("Bot admitted (status=%s)", status)
+                        break
+                    if any(s in status.lower() for s in ["fatal", "done", "error"]):
+                        logger.warning("Bot failed (status=%s) — aborting", status)
                         break
                 except Exception:
                     pass
                 await asyncio.sleep(1)
+
+            if not admitted:
+                logger.warning("Bot was NOT admitted after 3 min — cleaning up")
+                try:
+                    await self.recall.leave_call(self.bot_id)
+                except Exception:
+                    pass
+                return
 
             # 4c. Connect Deepgram NOW (after admission — no idle timeouts)
             await self.pipeline.connect()

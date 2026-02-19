@@ -1,5 +1,5 @@
 app = "ai-google-meet-v2"
-primary_region = "nrt"  # Tokyo (close to Recall ap-northeast-1)
+primary_region = "fra"  # Frankfurt (close to Recall eu-central-1)
 
 [http_service]
   internal_port = 8080

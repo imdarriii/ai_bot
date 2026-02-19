@@ -146,26 +146,17 @@ async function poll(){
   }
 }
 function connectCal(){
-  if($('gcalBtn').classList.contains('connected'))return;
   window.open('/auth/google','_blank','width=500,height=600');
-  // Poll for connection status
   const ci=setInterval(async()=>{
     const r=await fetch('/auth/google/status');
     const d=await r.json();
     if(d.connected){
       clearInterval(ci);
-      $('gcalBtn').classList.add('connected');
-      $('gcalBtn').innerHTML='Google Calendar connected';
+      $('gcalBtn').innerHTML='✓ Connected! You can close this.';
+      setTimeout(()=>{$('gcalBtn').innerHTML='Connect Google Calendar';},5000);
     }
   },2000);
 }
-// Check calendar status on load
-fetch('/auth/google/status').then(r=>r.json()).then(d=>{
-  if(d.connected){
-    $('gcalBtn').classList.add('connected');
-    $('gcalBtn').innerHTML='Google Calendar connected';
-  }
-});
 </script></body></html>"""
 
 
@@ -191,10 +182,18 @@ async def join(req: JoinRequest):
 
     async with _join_lock:
         if _agent is not None:
-            # If agent task is still running, don't replace it
             if _agent_task and not _agent_task.done():
-                return {"error": "Bot is already starting or in a session", "status": "joining"}
-            # Agent exists but task is done — clean up and proceed
+                # Force-cleanup stuck session
+                logger.warning("Force-cleaning old session before new join")
+                try:
+                    await _agent.leave()
+                except Exception:
+                    pass
+                _agent_task.cancel()
+                try:
+                    await _agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             _agent = None
             _agent_task = None
 
@@ -238,10 +237,18 @@ async def chat_webhook(request: Request):
     return {"status": "ok"}
 
 
+def _get_base_url(request: Request) -> str:
+    """Get base URL, forcing https if behind a reverse proxy (Fly.io etc)."""
+    base = str(request.base_url).rstrip("/")
+    if request.headers.get("x-forwarded-proto") == "https" and base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    return base
+
+
 @app.get("/auth/google")
 async def google_auth(request: Request):
     """Redirect user to Google OAuth consent screen."""
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    redirect_uri = _get_base_url(request) + "/auth/google/callback"
     url = google_calendar.get_auth_url(redirect_uri)
     from starlette.responses import RedirectResponse
     return RedirectResponse(url)
@@ -252,7 +259,7 @@ async def google_callback(request: Request, code: str = ""):
     """Handle OAuth callback from Google."""
     if not code:
         return HTMLResponse("<h2>Error: no code received</h2>")
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    redirect_uri = _get_base_url(request) + "/auth/google/callback"
     try:
         await google_calendar.exchange_code(code, redirect_uri)
         return HTMLResponse(
