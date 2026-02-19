@@ -628,6 +628,7 @@ TRANSCRIPT:
                 self.pipeline.set_speaker_name(num, best_name)
             except (ValueError, IndexError):
                 pass
+            self._backfill_speaker_name(dg_speaker, best_name)
             return best_name
 
         # Fallback: if only 1 human participant, use their name
@@ -639,9 +640,16 @@ TRANSCRIPT:
                 self.pipeline.set_speaker_name(num, name)
             except (ValueError, IndexError):
                 pass
+            self._backfill_speaker_name(dg_speaker, name)
             return name
 
         return dg_speaker
+
+    def _backfill_speaker_name(self, old_label: str, real_name: str) -> None:
+        """Update old transcript entries with the resolved real name."""
+        for entry in self._meeting_transcript:
+            if entry["speaker"] == old_label:
+                entry["speaker"] = real_name
 
     # ── Voice command processing ──────────────────────────────
 
@@ -815,8 +823,9 @@ TRANSCRIPT:
 
         elif self._alex_active:
             # Follow-up window — only respond to questions, not statements
-            is_question = (
+            is_followup = (
                 "?" in text
+                or len(lower.strip()) < 30  # short answers like "6PM", "yes", "at 5"
                 or lower.lstrip().startswith((
                     "what", "who", "where", "when", "why", "how",
                     "is it", "is there", "is that", "are there", "are you",
@@ -825,9 +834,10 @@ TRANSCRIPT:
                     "tell me", "explain", "describe",
                     "search", "find", "look up",
                     "and what", "and how", "and where", "and who",
+                    "at ", "for ", "on ", "schedule", "create",
                 ))
             )
-            if is_question:
+            if is_followup:
                 self._last_alex_time = time.time()
                 logger.info("Follow-up question for [%s]: %s", speaker, text[:80])
                 asyncio.create_task(self.pipeline.generate_response(text, speaker=speaker))
@@ -909,7 +919,11 @@ TRANSCRIPT:
                         RealTimeEndpoint(
                             type=RealTimeEndpointType.WEBHOOK,
                             url=f"{public_url}/webhook/chat",
-                            events=["participant_events.chat_message"],
+                            events=[
+                                "participant_events.chat_message",
+                                "participant_events.join",
+                                "participant_events.leave",
+                            ],
                         ),
                     ],
                 ),

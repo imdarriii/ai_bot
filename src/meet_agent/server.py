@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from .agent import MeetAgent
 from .config import settings
+from . import google_calendar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,6 +67,11 @@ _HTML = """<!DOCTYPE html>
   .circle-spinner{width:22px;height:22px;border:3px solid rgba(255,255,255,.2);
        border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
   .stack{color:#555;font-size:12px;margin-top:16px;text-align:center}
+  .gcal{width:100%;padding:12px;border:1px solid #333;border-radius:10px;font-size:14px;
+        cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:8px;
+        margin-top:12px;background:transparent;color:#aaa}
+  .gcal:hover{border-color:#4f8cff;color:#fff}
+  .gcal.connected{border-color:#5cb85c;color:#5cb85c;cursor:default}
 </style></head>
 <body><div class="card">
   <h1>Alex <span class="badge">v2</span></h1>
@@ -74,6 +80,7 @@ _HTML = """<!DOCTYPE html>
   <button class="btn join" id="joinBtn" onclick="doJoin()">Join Meeting</button>
   <button class="btn leave" id="leaveBtn" onclick="doLeave()" style="display:none">Leave Meeting</button>
   <div class="status" id="st"><span class="dot idle"></span> Idle — waiting for a link</div>
+  <button class="gcal" id="gcalBtn" onclick="connectCal()">Connect Google Calendar</button>
   <div class="stack">Deepgram STT + GPT-4o-mini + ElevenLabs TTS</div>
 </div>
 <script>
@@ -138,6 +145,27 @@ async function poll(){
     setTimeout(poll, 2000);
   }
 }
+function connectCal(){
+  if($('gcalBtn').classList.contains('connected'))return;
+  window.open('/auth/google','_blank','width=500,height=600');
+  // Poll for connection status
+  const ci=setInterval(async()=>{
+    const r=await fetch('/auth/google/status');
+    const d=await r.json();
+    if(d.connected){
+      clearInterval(ci);
+      $('gcalBtn').classList.add('connected');
+      $('gcalBtn').innerHTML='Google Calendar connected';
+    }
+  },2000);
+}
+// Check calendar status on load
+fetch('/auth/google/status').then(r=>r.json()).then(d=>{
+  if(d.connected){
+    $('gcalBtn').classList.add('connected');
+    $('gcalBtn').innerHTML='Google Calendar connected';
+  }
+});
 </script></body></html>"""
 
 
@@ -208,6 +236,39 @@ async def chat_webhook(request: Request):
     logger.info(">>> Chat webhook received: %s", str(body)[:300])
     asyncio.create_task(_agent._handle_chat_webhook(body))
     return {"status": "ok"}
+
+
+@app.get("/auth/google")
+async def google_auth(request: Request):
+    """Redirect user to Google OAuth consent screen."""
+    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    url = google_calendar.get_auth_url(redirect_uri)
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url)
+
+
+@app.get("/auth/google/callback")
+async def google_callback(request: Request, code: str = ""):
+    """Handle OAuth callback from Google."""
+    if not code:
+        return HTMLResponse("<h2>Error: no code received</h2>")
+    redirect_uri = str(request.base_url).rstrip("/") + "/auth/google/callback"
+    try:
+        await google_calendar.exchange_code(code, redirect_uri)
+        return HTMLResponse(
+            "<h2>Google Calendar connected!</h2>"
+            "<p>You can close this tab and go back to Alex.</p>"
+            "<script>setTimeout(()=>window.close(),2000)</script>"
+        )
+    except Exception as e:
+        logger.exception("Google OAuth failed")
+        return HTMLResponse(f"<h2>Error: {e}</h2>")
+
+
+@app.get("/auth/google/status")
+async def google_auth_status():
+    """Check if Google Calendar is connected."""
+    return {"connected": google_calendar.is_connected()}
 
 
 async def _run_agent():

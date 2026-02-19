@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     webhook_base_url: str = "https://localhost"
     webhook_port: int = 8080
 
+    # ── Google Calendar OAuth ────────────────────────────────────
+    google_client_id: str = ""
+    google_client_secret: str = ""
+
     # ── Bot ────────────────────────────────────────────────────
     bot_name: str = "Alex"
     recordings_dir: Path = Path("./recordings")

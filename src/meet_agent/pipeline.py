@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import time
+from datetime import date, timedelta
 from typing import Callable, Awaitable
 from urllib.parse import urlencode
 
@@ -42,6 +43,10 @@ When you answer:
 - NEVER add pleasantries, offers of help, or filler. No "let me know", "I'm here", "feel free to ask", "happy to help". Just answer.
 - NEVER ask clarifying questions. Do your best with what you heard, or use web_search.
 - For search requests — use web_search, then say "I sent the links to the chat, take a look." Never read URLs aloud. Always let the user know you sent something to chat.
+- For scheduling/meeting requests — you MUST call the create_calendar_event function. NEVER say "meeting scheduled" or "done" without actually calling the tool first. Use ONLY dates from this table:
+{date_table}
+  If title is missing, use "Meeting". If time is NOT specified, ask "What time?" and wait — do NOT use a default time, do NOT call the tool yet. After the tool returns, briefly confirm the date and time.
+- IMPORTANT: You MUST use the create_calendar_event tool for ANY request about scheduling, creating, or setting up meetings. Do NOT generate a response about scheduling without calling the tool. This is critical.
 - You have FULL access to the meeting chat. Messages from chat are injected into context as [CHAT HISTORY UPDATE]. When someone asks about what was said in chat, who wrote what, or asks to repeat/explain something from chat — answer using that data.
 - NEVER say "Recording stopped", "Recording started", or anything about recording status. That is handled by the system, not you.
 - Leave only when explicitly told "leave", "goodbye", or "you can go".
@@ -78,6 +83,25 @@ WEB_SEARCH_TOOL = {
                 "query": {"type": "string", "description": "The search query"},
             },
             "required": ["query"],
+        },
+    },
+}
+
+CALENDAR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "create_calendar_event",
+        "description": "Create a Google Calendar event with a Google Meet link. Use when someone asks to schedule, create, or set up a meeting/event/call.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Event title (e.g. 'Team standup')"},
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format"},
+                "time": {"type": "string", "description": "Start time in HH:MM 24h format (e.g. '17:00')"},
+                "duration_minutes": {"type": "integer", "description": "Duration in minutes (default 60)"},
+                "description": {"type": "string", "description": "Optional event description"},
+            },
+            "required": ["title", "date", "time"],
         },
     },
 }
@@ -120,6 +144,21 @@ SearchResultCallback = Callable[[str], Awaitable[None]]
 class PipecatPipeline:
     """Streaming voice pipeline: Deepgram STT → GPT-4o-mini → ElevenLabs TTS."""
 
+    @staticmethod
+    def _build_date_table(today: date) -> str:
+        """Build a 14-day date reference table for the LLM."""
+        lines = []
+        for i in range(14):
+            d = today + timedelta(days=i)
+            day_name = d.strftime("%A")
+            if i == 0:
+                lines.append(f"  TODAY ({day_name}): {d.isoformat()}")
+            elif i == 1:
+                lines.append(f"  TOMORROW ({day_name}): {d.isoformat()}")
+            else:
+                lines.append(f"  {day_name}: {d.isoformat()}")
+        return "\n".join(lines)
+
     def __init__(self) -> None:
         # Services
         self._openai = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -134,7 +173,15 @@ class PipecatPipeline:
         self._dg_reconnecting = False
 
         # Conversation history for LLM
-        self._messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        today = date.today()
+        weekday = today.strftime("%A")  # e.g. "Thursday"
+        self._messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT.format(
+                today=today.isoformat(),
+                weekday=weekday,
+                date_table=self._build_date_table(today),
+            )}
+        ]
 
         # Generation state
         self._generating = False
@@ -436,7 +483,7 @@ class PipecatPipeline:
                 model="gpt-4o-mini",
                 messages=self._messages,
                 stream=True,
-                tools=[WEB_SEARCH_TOOL],
+                tools=[WEB_SEARCH_TOOL, CALENDAR_TOOL],
             )
 
             full_text = ""
@@ -493,8 +540,9 @@ class PipecatPipeline:
                         logger.info("Sentence %d → TTS: %s", sentence_num, text_to_speak[:60])
                         await tts_queue.put(text_to_speak)
 
-            # Handle tool calls (web search)
+            # Handle tool calls (web search, calendar)
             if tool_calls and not self._cancel_event.is_set():
+                logger.info("Tool calls detected: %s", [tc["name"] for tc in tool_calls])
                 await tts_queue.put(None)
                 await worker_task
                 # Say "searching" before the actual search so user isn't left in silence
@@ -503,6 +551,8 @@ class PipecatPipeline:
                     await self._turn_text_cb("Let me look that up.")
                 await self._handle_tool_calls(tool_calls, full_text)
                 return
+            elif not tool_calls:
+                logger.info("No tool calls in response (text only): %s", full_text[:100])
 
             # Flush remaining text
             if sentence_buffer.strip() and not self._cancel_event.is_set():
@@ -556,6 +606,37 @@ class PipecatPipeline:
                 except Exception:
                     result = "Search failed"
                     logger.exception("Search error")
+            elif tc["name"] == "create_calendar_event":
+                try:
+                    from . import google_calendar
+                    args = json.loads(tc["arguments"])
+                    logger.info("Creating calendar event: %s", args)
+                    if not google_calendar.is_connected():
+                        result = "Google Calendar is not connected. Ask the user to connect it on the web interface first."
+                    else:
+                        event = await google_calendar.create_event(
+                            title=args.get("title", "Meeting"),
+                            date_str=args.get("date", ""),
+                            time_str=args.get("time", ""),
+                            duration_minutes=args.get("duration_minutes", 60),
+                            description=args.get("description", ""),
+                        )
+                        meet_link = event.get("meet_link", "")
+                        cal_link = event.get("calendar_link", "")
+                        result = f"Event created successfully. Title: {event['title']}, Start: {event['start']}, Duration: {event['duration']} min."
+                        if meet_link:
+                            result += f" Meet link: {meet_link}"
+                        # Send event details to chat
+                        if self._search_result_cb:
+                            chat_msg = f"Meeting scheduled: {event['title']} on {event['start']}"
+                            if meet_link:
+                                chat_msg += f"\nMeet: {meet_link}"
+                            if cal_link:
+                                chat_msg += f"\nCalendar: {cal_link}"
+                            asyncio.create_task(self._search_result_cb(chat_msg))
+                except Exception:
+                    result = "Failed to create calendar event"
+                    logger.exception("Calendar event error")
             else:
                 result = f"Unknown function: {tc['name']}"
 
