@@ -1,0 +1,11 @@
+app = "ai-google-meet-v2"
+primary_region = "nrt"  # Tokyo (close to Recall ap-northeast-1)
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+[[http_service.checks]]
+  path = "/health"
+  interval = "30s"
+  timeout = "5s"
