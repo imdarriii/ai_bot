@@ -48,7 +48,13 @@ class RealTimeEndpoint(BaseModel):
 class RecordingConfig(BaseModel):
     video_mixed_mp4: dict[str, Any] | None = None
     audio_mixed_raw: dict[str, Any] | None = None
+    audio_separate_raw: dict[str, Any] | None = None
+    transcript: dict[str, Any] | None = None
     realtime_endpoints: list[RealTimeEndpoint] = Field(default_factory=list)
+
+
+class TranscriptionOptions(BaseModel):
+    provider: str = "default"
 
 
 class CreateBotRequest(BaseModel):
@@ -56,6 +62,7 @@ class CreateBotRequest(BaseModel):
     bot_name: str = "AI Assistant"
     automatic_audio_output: AutomaticAudioOutput | None = None
     recording_config: RecordingConfig = Field(default_factory=RecordingConfig)
+    transcription_options: TranscriptionOptions | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

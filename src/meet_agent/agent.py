@@ -30,6 +30,7 @@ from .transport.models import (
     RealTimeEndpoint,
     RealTimeEndpointType,
     RecordingConfig,
+    TranscriptionOptions,
 )
 
 # Silent MP3 (0.1s) — required for output_audio endpoint
@@ -159,6 +160,7 @@ class MeetAgent:
 
         self.bot_id: str | None = None
         self._leave_event = asyncio.Event()
+        self._stop_event = asyncio.Event()
         self._active_ws_id: int = 0
 
         # Audio output buffer — accumulate PCM chunks from TTS
@@ -184,14 +186,17 @@ class MeetAgent:
 
         self._admitted = False
         self._leaving = False
+        self._in_waiting_room = False
 
         # Chat
         self._seen_chat_ids: set[str] = set()
         self._chat_history: list[dict] = []
+        self._chat_injected_count: int = 0  # how many chat msgs already in voice LLM
+        self._recent_chat_sent: list[tuple[float, str]] = []  # dedup: (time, text)
 
-        # Speaker name mapping: Deepgram speaker_id → real name from Recall
+        # Speaker tracking: participant_id → name, and audio stream → speaker
         self._participants: dict[str, str] = {}  # participant_id → name
-        self._recent_recall_transcripts: list[tuple[float, str, str]] = []  # (time, name, text)
+        self._audio_speakers: dict[str, float] = {}  # participant_name → last_audio_time
 
         # Meeting transcript for summary
         self._meeting_transcript: list[dict] = []  # {"speaker": ..., "text": ..., "time": ...}
@@ -239,20 +244,39 @@ class MeetAgent:
                         msg = json.loads(data["text"])
                         event = msg.get("event", "")
 
-                        if event == "audio_mixed_raw.data":
-                            b64_audio = msg["data"]["data"]["buffer"]
+                        if event == "audio_separate_raw.data":
+                            inner = msg["data"]["data"]
+                            b64_audio = inner["buffer"]
                             pcm = base64.b64decode(b64_audio)
                             chunks += 1
                             total_bytes += len(pcm)
 
-                            # Send audio directly to Deepgram (16kHz, no resampling needed)
-                            if self._admitted:
-                                await self.pipeline.send_audio(pcm)
+                            # Track speaker from per-participant stream
+                            participant = inner.get("participant", {})
+                            p_name = participant.get("name", "")
+                            p_id = str(participant.get("id", ""))
+                            if p_id and p_name:
+                                self._participants[p_id] = p_name
+
+                            # Audio flowing = bot IS in the call
+                            if not self._admitted:
+                                self._admitted = True
+                                logger.info("Bot admitted (audio WebSocket data received)")
+
+                            # Skip bot's own audio — don't send to Deepgram
+                            # This eliminates echo completely
+                            if p_name and p_name.lower() == settings.bot_name.lower():
+                                continue
+
+                            if p_name:
+                                self._audio_speakers[p_name] = time.time()
+
+                            await self.pipeline.send_audio(pcm)
 
                             if chunks % 100 == 1:
                                 logger.info(
-                                    "Audio IN: %d chunks, %d KB → Deepgram",
-                                    chunks, total_bytes // 1024,
+                                    "Audio IN: %d chunks, %d KB (speaker: %s)",
+                                    chunks, total_bytes // 1024, p_name or "?",
                                 )
                         else:
                             logger.info("WS event: %s", event or data["text"][:200])
@@ -279,9 +303,14 @@ class MeetAgent:
         self._audio_buffer.extend(pcm_data)
 
     async def _on_interrupted(self) -> None:
-        """User started speaking — discard accumulated audio."""
+        """User started speaking — discard accumulated audio and pending responses."""
         self._audio_buffer.clear()
-        logger.info("Interrupted — audio buffer cleared")
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        logger.info("Interrupted — audio buffer and queue cleared")
 
     async def _on_turn_text(self, text: str) -> None:
         """Response complete — queue for sequential processing."""
@@ -319,7 +348,17 @@ class MeetAgent:
             if self._leaving:
                 break
 
+            # Dedup: skip if identical text was sent in last 15s
+            now_d = time.time()
+            self._recent_chat_sent = [(t, m) for t, m in self._recent_chat_sent if now_d - t < 15]
+            if text and any(m == text for _, m in self._recent_chat_sent):
+                logger.info("Dedup: skipping duplicate response: %s", text[:60])
+                continue
+
             self._is_talking = True
+            # Reset follow-up timer — bot is speaking, so user is listening
+            if self._alex_active:
+                self._last_alex_time = time.time()
             try:
                 if self.bot_id and pcm:
                     try:
@@ -331,12 +370,20 @@ class MeetAgent:
                         await asyncio.gather(*tasks)
                         # Wait for audio to finish playing before sending next
                         # MP3 at 64kbps: duration = size_bytes * 8 / 64000
+                        # Check stop_event every 0.2s so we can break early
                         duration = len(pcm) * 8 / 64000
-                        await asyncio.sleep(duration)
+                        self._stop_event.clear()
+                        steps = int(duration / 0.2)
+                        for _ in range(max(steps, 1)):
+                            if self._stop_event.is_set() or self._leaving:
+                                logger.info("Stop during playback — skipping remaining audio")
+                                break
+                            await asyncio.sleep(0.2)
                         logger.info("Audio sent: %d KB MP3 (%.1fs)", len(pcm) // 1024, duration)
                         if text:
                             logger.info("Chat sent: %s", text[:80])
                             self._chat_history.append({"sender": "Alex (bot)", "text": text})
+                            self._recent_chat_sent.append((time.time(), text))
                             # Add bot response to meeting transcript for summary
                             elapsed = time.time() - self._meeting_start_time if self._meeting_start_time else 0
                             self._meeting_transcript.append({
@@ -350,6 +397,7 @@ class MeetAgent:
                     try:
                         await self.recall.send_chat_message(self.bot_id, text)
                         logger.info("Chat sent: %s", text[:80])
+                        self._recent_chat_sent.append((time.time(), text))
                     except Exception:
                         logger.exception("Failed to send chat message")
             finally:
@@ -385,23 +433,16 @@ class MeetAgent:
                 logger.info("Participant left: %s (id=%s)", name, pid)
                 return
 
-            # Recall transcript — use for speaker name mapping
+            # Recall transcript — log only (speaker names come from separate audio streams)
             if event == "transcript.data":
                 t_data = body.get("data", {}).get("data", {})
-                speaker = t_data.get("speaker", {})
-                speaker_name = speaker.get("name", "")
+                participant = t_data.get("participant", t_data.get("speaker", {}))
+                speaker_name = participant.get("name", "") if isinstance(participant, dict) else str(participant)
                 text = t_data.get("words", "")
                 if isinstance(text, list):
                     text = " ".join(w.get("text", "") for w in text)
                 text = text.strip()
                 if speaker_name and text:
-                    self._recent_recall_transcripts.append((time.time(), speaker_name, text))
-                    # Keep only last 20, max 30 seconds old
-                    now = time.time()
-                    self._recent_recall_transcripts = [
-                        (t, n, tx) for t, n, tx in self._recent_recall_transcripts
-                        if now - t < 30
-                    ][-20:]
                     logger.info("Recall transcript [%s]: %s", speaker_name, text[:80])
                 return
 
@@ -594,66 +635,12 @@ TRANSCRIPT:
             except Exception:
                 logger.exception("Failed to send search results")
 
-    # ── Speaker name resolution ──────────────────────────────
-
-    def _resolve_speaker_name(self, dg_speaker: str, text: str) -> str:
-        """Try to match Deepgram speaker label to a real name using Recall transcripts."""
-        # If pipeline already has a real name mapped, use it
-        if dg_speaker and not dg_speaker.startswith("Speaker "):
-            return dg_speaker
-
-        # Try to match by text similarity with recent Recall transcripts
-        text_lower = text.lower().strip()
-        text_words = set(text_lower.split())
-        if len(text_words) < 2:
-            return dg_speaker
-
-        best_name = None
-        best_overlap = 0.0
-        now = time.time()
-
-        for t, name, recall_text in self._recent_recall_transcripts:
-            if now - t > 15:  # only match within 15 seconds
-                continue
-            r_words = set(recall_text.lower().strip().split())
-            if not r_words:
-                continue
-            overlap = len(text_words & r_words) / min(len(text_words), len(r_words))
-            if overlap > best_overlap and overlap > 0.5:
-                best_overlap = overlap
-                best_name = name
-
-        if best_name:
-            # Save mapping in pipeline for future use
-            logger.info("Speaker resolved: %s → %s (%.0f%% match)", dg_speaker, best_name, best_overlap * 100)
-            # Extract speaker number and update pipeline mapping
-            try:
-                num = int(dg_speaker.replace("Speaker ", "")) - 1
-                self.pipeline.set_speaker_name(num, best_name)
-            except (ValueError, IndexError):
-                pass
-            self._backfill_speaker_name(dg_speaker, best_name)
-            return best_name
-
-        # Fallback: if only 1 human participant, use their name
-        non_bot_names = [n for n in self._participants.values() if n.lower() != settings.bot_name.lower()]
-        if len(non_bot_names) == 1:
-            name = non_bot_names[0]
-            try:
-                num = int(dg_speaker.replace("Speaker ", "")) - 1
-                self.pipeline.set_speaker_name(num, name)
-            except (ValueError, IndexError):
-                pass
-            self._backfill_speaker_name(dg_speaker, name)
-            return name
-
-        return dg_speaker
-
-    def _backfill_speaker_name(self, old_label: str, real_name: str) -> None:
-        """Update old transcript entries with the resolved real name."""
-        for entry in self._meeting_transcript:
-            if entry["speaker"] == old_label:
-                entry["speaker"] = real_name
+    async def _sync_chat_to_voice(self) -> None:
+        """Inject NEW chat messages into voice LLM so it knows chat history."""
+        if len(self._chat_history) > self._chat_injected_count:
+            new_msgs = self._chat_history[self._chat_injected_count:]
+            await self.pipeline.inject_chat_context(new_msgs)
+            self._chat_injected_count = len(self._chat_history)
 
     # ── Voice command processing ──────────────────────────────
 
@@ -664,7 +651,19 @@ TRANSCRIPT:
         (in v1, OpenAI Realtime generated responses automatically and we filtered output).
         Speaker comes from Deepgram diarization — identifies WHO is speaking.
         """
-        speaker = self._resolve_speaker_name(speaker, text)
+        # Resolve speaker from separate audio streams (each chunk has participant info)
+        now = time.time()
+        recent_speakers = [(name, t) for name, t in self._audio_speakers.items()
+                           if now - t < 3.0]
+        if len(recent_speakers) == 1:
+            speaker = recent_speakers[0][0]
+        elif len(recent_speakers) > 1:
+            speaker = max(recent_speakers, key=lambda x: x[1])[0]
+        else:
+            non_bot = [n for n in self._participants.values()
+                       if n.lower() != settings.bot_name.lower()]
+            if len(non_bot) == 1:
+                speaker = non_bot[0]
         logger.info("[%s]: %s", speaker, text)
         lower = text.lower().strip().rstrip(".!,")
 
@@ -684,6 +683,15 @@ TRANSCRIPT:
         })
 
         # ── SYSTEM COMMANDS — always work, even when muted ──
+
+        # Stop command — interrupt current response
+        _stop_words = ["stop", "стоп", "хватит", "замолчи", "enough", "shut up", "be quiet"]
+        if any(w in lower.split() for w in _stop_words):
+            self._stop_event.set()
+            await self.pipeline.cancel_response()
+            await self._on_interrupted()
+            logger.info(">>> STOP command — response cancelled")
+            return
 
         # Summarize command
         _summary_phrases = [
@@ -759,7 +767,13 @@ TRANSCRIPT:
 
         # If muted — but "Alex" was said, auto-unmute
         if self._muted:
-            _wake_words_muted = ["alex", "алекс", "aleks", "аlex"]
+            # Still feed conversation to GPT so it has context when unmuted
+            if speaker and speaker != "Unknown":
+                self.pipeline.add_context(f"[{speaker}]: {text}")
+            else:
+                self.pipeline.add_context(f"[Participant]: {text}")
+
+            _wake_words_muted = ["alex", "алекс", "aleks", "аlex", "ayush", "annex"]
             if any(w in lower for w in _wake_words_muted):
                 self._muted = False
                 self._alex_active = True
@@ -771,12 +785,13 @@ TRANSCRIPT:
                 clean = clean.strip(",.!? ")
                 if clean and len(clean) >= 3:
                     logger.info(">>> Alex called while muted — UNMUTED + answering: %s", text[:80])
+                    await self._sync_chat_to_voice()
                     asyncio.create_task(self.pipeline.generate_response(text, speaker=speaker))
                 else:
                     logger.info(">>> Alex called while muted — AUTO-UNMUTED")
                     await self.pipeline.send_confirmation("I'm here.")
             else:
-                logger.info("Muted — ignored: %s", text[:80])
+                logger.info("Muted — listening silently: %s", text[:80])
             return
 
         # ── WAKE WORD LOGIC ──────────────────────────────────
@@ -785,16 +800,12 @@ TRANSCRIPT:
             "alex", "алекс", "aleks", "аlex", "alex,",
             "alec", "alexa", "aleksa", "al ex", "al-ex",
             "alix", "alex's", "alexs", "oleks",
+            "ayush", "annex",
         ]
         if any(w in lower for w in _wake_words):
             self._alex_active = True
             self._last_alex_time = time.time()
             logger.info(">>> ALEX called — bot is active")
-
-        # Deactivate after 2 minutes
-        if self._alex_active and (time.time() - self._last_alex_time > 120):
-            self._alex_active = False
-            logger.info("Alex timeout (2 min) — bot goes silent")
 
         # "That's all" / "thanks Alex" = done
         if self._alex_active and any(p in lower for p in [
@@ -822,29 +833,39 @@ TRANSCRIPT:
                 await self.pipeline.send_confirmation("I'm here, listening.")
                 return
             # Directly addressed — always respond
+            await self._sync_chat_to_voice()
             logger.info("Generating response for [%s]: %s", speaker, text[:80])
             asyncio.create_task(self.pipeline.generate_response(text, speaker=speaker))
 
         elif self._alex_active:
             # Follow-up window — only respond to questions, not statements
-            is_followup = (
-                "?" in text
-                or len(lower.strip()) < 30  # short answers like "6PM", "yes", "at 5"
-                or lower.lstrip().startswith((
-                    "what", "who", "where", "when", "why", "how",
-                    "is it", "is there", "is that", "are there", "are you",
-                    "do you", "does", "can you", "could you",
-                    "will ", "would ", "should ",
-                    "tell me", "explain", "describe",
-                    "search", "find", "look up",
-                    "and what", "and how", "and where", "and who",
-                    "at ", "for ", "on ", "schedule", "create",
-                ))
-            )
+            _starts = lower.lstrip().startswith((
+                "what", "who", "where", "when", "why", "how",
+                "is it", "is there", "is that", "are there", "are you",
+                "do you", "does", "can you", "could you",
+                "will ", "would ", "should ",
+                "tell me", "explain", "describe",
+                "search", "find", "look up",
+                "and what", "and how", "and where", "and who",
+                "at ", "for ", "on ", "schedule", "create",
+            ))
+            # Also check if action words appear anywhere in the text
+            # (catches "so please find ...", "yeah search for ...", etc.)
+            _has_action = any(w in lower for w in (
+                "find ", "search ", "look up", "tell me", "explain ",
+                "describe ", "schedule ", "create ", "help me",
+                "can you", "could you", "would you", "please ",
+            ))
+            is_followup = "?" in text or _starts or _has_action
             if is_followup:
                 self._last_alex_time = time.time()
+                await self._sync_chat_to_voice()
                 logger.info("Follow-up question for [%s]: %s", speaker, text[:80])
                 asyncio.create_task(self.pipeline.generate_response(text, speaker=speaker))
+            elif time.time() - self._last_alex_time > 25:
+                # Timeout only on non-questions — follow-ups always reset timer
+                self._alex_active = False
+                logger.info("Alex timeout (25s) — bot goes silent")
             else:
                 logger.info("Statement during active window — silent: %s", text[:80])
 
@@ -853,11 +874,13 @@ TRANSCRIPT:
     @property
     def status(self) -> str:
         if not self.bot_id:
-            return "idle"
+            return "joining"  # bot_id not set yet but agent is running
         if self._leaving:
             return "leaving"
         if self._admitted:
             return "in_call"
+        if self._in_waiting_room:
+            return "waiting_room"
         return "joining"
 
     async def leave(self) -> None:
@@ -913,12 +936,16 @@ TRANSCRIPT:
                 ),
                 recording_config=RecordingConfig(
                     video_mixed_mp4={},
-                    audio_mixed_raw={},
+                    audio_separate_raw={},
+                    transcript={
+                        "provider": {"recallai_streaming": {}},
+                        "diarization": {"use_separate_streams_when_available": True},
+                    },
                     realtime_endpoints=[
                         RealTimeEndpoint(
                             type=RealTimeEndpointType.WEBSOCKET,
                             url=f"{ws_url}/ws/audio",
-                            events=["audio_mixed_raw.data"],
+                            events=["audio_separate_raw.data"],
                         ),
                         RealTimeEndpoint(
                             type=RealTimeEndpointType.WEBHOOK,
@@ -927,6 +954,7 @@ TRANSCRIPT:
                                 "participant_events.chat_message",
                                 "participant_events.join",
                                 "participant_events.leave",
+                                "transcript.data",
                             ],
                         ),
                     ],
@@ -948,25 +976,37 @@ TRANSCRIPT:
             print()
 
             # 4b. Wait for admit (max 3 min, then give up)
+            # _admitted can also be set by _handle_audio_ws when audio data arrives
             logger.info("Waiting for bot to be admitted...")
-            admitted = False
             for _ in range(180):
+                if self._admitted:
+                    logger.info("Bot admitted (confirmed by audio WebSocket)")
+                    break
                 try:
                     bot_info = await self.recall.get_bot(self.bot_id)
                     status = bot_info.latest_status or ""
+                    if "waiting_room" in status.lower():
+                        if not self._in_waiting_room:
+                            self._in_waiting_room = True
+                            logger.info("Bot is in the waiting room")
                     if "in_call" in status.lower():
                         self._admitted = True
-                        admitted = True
+                        self._in_waiting_room = False
                         logger.info("Bot admitted (status=%s)", status)
                         break
-                    if any(s in status.lower() for s in ["fatal", "done", "error"]):
+                    if any(s in status.lower() for s in ["fatal", "error"]):
                         logger.warning("Bot failed (status=%s) — aborting", status)
                         break
+                    if "done" in status.lower():
+                        if self._admitted:
+                            logger.info("Status=done but audio active — continuing")
+                            break
+                        logger.info("Status=done, checking audio... (admitted=%s)", self._admitted)
                 except Exception:
                     pass
                 await asyncio.sleep(1)
 
-            if not admitted:
+            if not self._admitted:
                 logger.warning("Bot was NOT admitted after 3 min — cleaning up")
                 try:
                     await self.recall.leave_call(self.bot_id)
@@ -988,11 +1028,9 @@ TRANSCRIPT:
             self._meeting_start_time = time.time()
             await asyncio.sleep(3)
             await self.pipeline.send_greeting()
-            await asyncio.sleep(8)
+            await asyncio.sleep(4)
             self._is_talking = False
-            self._alex_active = False
-            self._last_alex_time = 0.0
-            logger.info("Greeting done — bot is SILENT until 'Alex' is called")
+            logger.info("Greeting done — bot is active")
 
             # 5. Wait to leave
             await self._leave_event.wait()

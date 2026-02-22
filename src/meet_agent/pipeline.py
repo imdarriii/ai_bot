@@ -32,20 +32,21 @@ logger = logging.getLogger(__name__)
 # ── Prompts ───────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are Alex — a professional AI assistant in a Google Meet call. You are serious, precise, and efficient. ALWAYS respond in ENGLISH.
+You are Alex — a friendly and helpful AI assistant in a Google Meet call. You are warm, natural, and efficient. ALWAYS respond in ENGLISH.
 
-You ONLY speak when addressed by name "Alex". If no one called you — stay silent. After being called, answer follow-up questions without requiring your name again.
+NOTE: You are receiving this message because the user IS talking to you. Always respond helpfully. Never refuse to answer. Never say things like "I don't respond unless addressed by name" — just answer naturally.
 
-Messages from participants are prefixed with their speaker label, e.g. "[Dariga]: question". Use this to address people BY NAME in your responses. For example: "Sure, Dariga, the capital of France is Paris." or "Good question, Dariga." Always include the speaker's name at least once in your response — it makes the conversation feel personal and natural.
+Messages from participants are prefixed with their name (e.g. "[Dariga]: question"). Address them BY NAME naturally (e.g. "Sure, Dariga, ..."). If the speaker is "Unknown", just answer without using any name.
 
 When you answer:
 - Be direct and concise. 1-3 sentences max. Give the answer and stop.
-- Always use the speaker's name naturally in your response (e.g. "Sure, John, ..." or "John, the answer is..."). NEVER prefix your response with "[Alex]:" or any brackets.
-- NEVER add pleasantries, offers of help, or filler. No "let me know", "I'm here", "feel free to ask", "happy to help". Just answer.
+- Use the speaker's name naturally in your response.
+- NEVER prefix your response with "[Alex]:" or any brackets.
+- If someone greets you (e.g. "Alex, how are you?", "Hey Alex"), respond warmly and naturally (e.g. "Hey! I'm doing great, what can I help with?").
 - NEVER ask clarifying questions. Do your best with what you heard.
 - Do NOT use web_search for simple factual questions you already know (capitals, math, definitions, history, science). Just answer directly.
 - ONLY use web_search when the user explicitly asks to "search", "find", "look up", or needs real-time data (news, weather, stock prices). You MUST call the tool — never say "I sent links" without calling it.
-- After web_search returns, say "I sent the links to the chat, take a look."
+- After web_search returns, briefly mention what you found and say "I sent the links to the chat, take a look." NEVER read URLs or links aloud — they are already in the chat.
 - For scheduling/meeting requests — you MUST call the create_calendar_event function. NEVER say "meeting scheduled" or "done" without actually calling the tool first. Use ONLY dates from this table:
 {date_table}
   If title is missing, use "Meeting". If time is NOT specified, ask "What time?" and wait — do NOT use a default time, do NOT call the tool yet. After the tool returns, briefly confirm the date and time.
@@ -110,24 +111,30 @@ CALENDAR_TOOL = {
 }
 
 
-def _do_web_search(query: str, max_results: int = 5) -> str:
+def _do_web_search(query: str, max_results: int = 5) -> tuple[str, str]:
+    """Returns (chat_result_with_urls, voice_result_no_urls)."""
     try:
         ddgs = DDGS()
         results = list(ddgs.text(query, max_results=max_results))
         if not results:
-            return "No results found."
-        lines = []
+            return "No results found.", "No results found."
+        chat_lines = []
+        voice_lines = []
         for i, r in enumerate(results, 1):
             title = r.get("title", "")
             url = r.get("href", "")
             if url:
-                lines.append(f"{i}. {title}\n{url}")
+                chat_lines.append(f"{i}. {title}\n{url}")
             else:
-                lines.append(f"{i}. {title}")
-        return "\n\n".join(lines)
+                chat_lines.append(f"{i}. {title}")
+            voice_lines.append(f"{i}. {title}")
+        chat_text = "\n\n".join(chat_lines)
+        voice_text = "\n".join(voice_lines) + "\n\n(Links already sent to chat. Do NOT read URLs. Just say you sent the links to the chat.)"
+        return chat_text, voice_text
     except Exception as e:
         logger.exception("Search error")
-        return f"Search failed: {e}"
+        msg = f"Search failed: {e}"
+        return msg, msg
 
 
 def should_leave(text: str) -> bool:
@@ -175,6 +182,11 @@ class PipecatPipeline:
         self._dg_reconnect_lock = asyncio.Lock()
         self._dg_reconnecting = False
 
+        # ElevenLabs WebSocket TTS — one generation at a time
+        self._el_ws = None
+        self._el_lock = asyncio.Lock()
+
+
         # Conversation history for LLM
         today = date.today()
         weekday = today.strftime("%A")  # e.g. "Thursday"
@@ -196,6 +208,7 @@ class PipecatPipeline:
 
         # Echo detection: track recent bot outputs
         self._recent_bot_outputs: list[tuple[float, str]] = []
+
 
         # Speaker diarization: map Deepgram speaker IDs to names
         self._speakers: dict[int, str] = {}
@@ -285,7 +298,7 @@ class PipecatPipeline:
             "channels": "1",
             "interim_results": "false",
             "vad_events": "true",
-            "endpointing": "500",
+            "endpointing": "300",
             "diarize": "true",
             "keywords": "Alex:5,mute:3,unmute:3,leave:3,summarize:3",
             "punctuate": "true",
@@ -403,6 +416,11 @@ class PipecatPipeline:
                 await self._dg_ws.close()
             except Exception:
                 pass
+        if self._el_ws:
+            try:
+                await self._el_ws.close()
+            except Exception:
+                pass
         logger.info("Pipeline closed")
 
     # ── Audio input ───────────────────────────────────────────
@@ -447,6 +465,17 @@ class PipecatPipeline:
         self._speakers[speaker_id] = name
         logger.info("Speaker %d → %s", speaker_id, name)
 
+    def add_context(self, text: str) -> None:
+        """Add overheard conversation to LLM context (used during mute).
+
+        This lets GPT know what was discussed even while the bot was muted,
+        so it can give relevant answers when unmuted.
+        """
+        self._messages.append({"role": "user", "content": f"[Overheard while muted] {text}"})
+        # Keep context window manageable — trim if too long
+        if len(self._messages) > 60:
+            self._messages = [self._messages[0]] + self._messages[-40:]
+
     async def generate_response(self, user_text: str, speaker: str = "Unknown") -> None:
         """Generate LLM response and stream TTS audio.
 
@@ -460,6 +489,9 @@ class PipecatPipeline:
             # Cancel current generation to handle the new question
             logger.info("New question while generating — cancelling previous response")
             self._cancel_event.set()
+            # Clear pending audio/responses from cancelled generation
+            if self._interrupt_cb:
+                await self._interrupt_cb()
             for _ in range(30):  # wait up to 3s for cleanup
                 await asyncio.sleep(0.1)
                 if not self._generating:
@@ -601,11 +633,12 @@ class PipecatPipeline:
                     args = json.loads(tc["arguments"])
                     query = args.get("query", "")
                     logger.info("Searching: %s", query)
-                    result = await asyncio.get_event_loop().run_in_executor(
+                    chat_result, voice_result = await asyncio.get_event_loop().run_in_executor(
                         None, _do_web_search, query
                     )
-                    if self._search_result_cb and result:
-                        asyncio.create_task(self._search_result_cb(result))
+                    if self._search_result_cb and chat_result:
+                        asyncio.create_task(self._search_result_cb(chat_result))
+                    result = voice_result  # LLM gets titles only, no URLs
                 except Exception:
                     result = "Search failed"
                     logger.exception("Search error")
@@ -722,12 +755,100 @@ class PipecatPipeline:
     # ── ElevenLabs TTS ────────────────────────────────────────
 
     async def _tts_generate(self, text: str) -> None:
-        """Stream TTS audio from ElevenLabs REST API."""
+        """Generate TTS audio — ElevenLabs WebSocket with REST fallback.
+
+        The _el_lock ensures only one sentence generates at a time,
+        preventing audio overlap or race conditions.
+        """
         if not text.strip() or self._cancel_event.is_set():
             return
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice_id}/stream"
+        async with self._el_lock:
+            try:
+                await self._tts_ws(text)
+            except Exception:
+                logger.warning("ElevenLabs WS failed — falling back to REST")
+                self._el_ws = None
+                await self._tts_rest(text)
 
+    async def _connect_el_ws(self) -> None:
+        """Connect to ElevenLabs WebSocket for streaming TTS."""
+        if self._el_ws:
+            try:
+                await self._el_ws.close()
+            except Exception:
+                pass
+            self._el_ws = None
+        url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech/"
+            f"{self._voice_id}/stream-input"
+            f"?model_id=eleven_turbo_v2_5"
+            f"&output_format=mp3_44100_64"
+        )
+        self._el_ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
+        logger.info("ElevenLabs WebSocket connected")
+
+    async def _tts_ws(self, text: str) -> None:
+        """WebSocket TTS — sends text, receives ALL audio before returning."""
+        bos_msg = json.dumps({
+            "text": text + " ",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+            "xi_api_key": self._elevenlabs_key,
+        })
+        flush_msg = json.dumps({"text": ""})
+
+        # Try to send; reconnect once if WS was closed after previous isFinal
+        for attempt in range(2):
+            if not self._el_ws:
+                await self._connect_el_ws()
+            try:
+                await self._el_ws.send(bos_msg)
+                await self._el_ws.send(flush_msg)
+                break
+            except Exception:
+                logger.info("ElevenLabs WS send failed (attempt %d) — reconnecting", attempt + 1)
+                self._el_ws = None
+                if attempt == 1:
+                    raise  # Give up, fall back to REST
+
+        # Receive ALL audio chunks until isFinal — strictly sequential
+        start = time.time()
+        while True:
+            if self._cancel_event.is_set():
+                try:
+                    await self._el_ws.close()
+                except Exception:
+                    pass
+                self._el_ws = None
+                return
+
+            if time.time() - start > 15.0:
+                logger.warning("ElevenLabs WS overall timeout (15s)")
+                self._el_ws = None
+                return
+
+            try:
+                raw = await asyncio.wait_for(self._el_ws.recv(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue  # Re-check cancel event and overall timeout
+
+            data = json.loads(raw)
+            audio_b64 = data.get("audio")
+            if audio_b64:
+                audio_bytes = base64.b64decode(audio_b64)
+                if self._audio_chunk_cb and audio_bytes:
+                    self._tts_playing = True
+                    await self._audio_chunk_cb(audio_bytes)
+
+            if data.get("isFinal"):
+                # ElevenLabs closes the connection after isFinal —
+                # mark as None so next sentence opens a fresh connection
+                self._el_ws = None
+                break
+
+    async def _tts_rest(self, text: str) -> None:
+        """REST API fallback for TTS."""
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{self._voice_id}/stream"
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 async with client.stream(
@@ -749,7 +870,7 @@ class PipecatPipeline:
                 ) as response:
                     if response.status_code != 200:
                         body = await response.aread()
-                        logger.error("ElevenLabs error %d: %s", response.status_code, body[:200])
+                        logger.error("ElevenLabs REST error %d: %s", response.status_code, body[:200])
                         return
 
                     async for chunk in response.aiter_bytes(chunk_size=4096):
@@ -759,7 +880,7 @@ class PipecatPipeline:
                             self._tts_playing = True
                             await self._audio_chunk_cb(chunk)
         except Exception:
-            logger.exception("ElevenLabs TTS error")
+            logger.exception("ElevenLabs REST TTS error")
 
     # ── Echo detection ────────────────────────────────────────
 

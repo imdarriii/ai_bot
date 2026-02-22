@@ -55,61 +55,98 @@ _HTML = """<!DOCTYPE html>
        font-weight:600;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:8px}
   .join{background:#4f8cff;color:#fff}.join:hover{background:#3a7ae8}
   .join:disabled{background:#333;color:#666;cursor:not-allowed}
-  .join.loading{background:#2a5db8;color:#fff;cursor:wait}
   .leave{background:#ff4f4f;color:#fff;margin-top:10px}.leave:hover{background:#e83a3a}
   .status{margin-top:20px;padding:14px;border-radius:10px;background:#111;
-          text-align:center;font-size:14px}
-  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:middle}
-  .dot.idle{background:#666}.dot.joining{background:#f0ad4e;animation:pulse 1s infinite}
-  .dot.in_call{background:#5cb85c}.dot.leaving{background:#ff4f4f}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+          text-align:center;font-size:14px;display:none}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .circle-spinner{width:22px;height:22px;border:3px solid rgba(255,255,255,.2);
-       border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .big-spinner-wrap{display:none;flex-direction:column;align-items:center;gap:20px;padding:30px 0}
+  .big-spinner{width:60px;height:60px;border:5px solid rgba(79,140,255,.2);
+       border-top-color:#4f8cff;border-radius:50%;animation:spin .8s linear infinite}
+  .big-spinner.waiting{border-color:rgba(240,173,78,.2);border-top-color:#f0ad4e}
+  .big-spinner.active{border-color:rgba(92,184,92,.2);border-top-color:#5cb85c;animation:none}
+  .big-status{font-size:16px;font-weight:500;text-align:center;line-height:1.5}
+  .big-sub{font-size:13px;color:#888;text-align:center}
   .stack{color:#555;font-size:12px;margin-top:16px;text-align:center}
   .gcal{width:100%;padding:12px;border:1px solid #333;border-radius:10px;font-size:14px;
         cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:8px;
         margin-top:12px;background:transparent;color:#aaa}
   .gcal:hover{border-color:#4f8cff;color:#fff}
-  .gcal.connected{border-color:#5cb85c;color:#5cb85c;cursor:default}
+  .check-icon{width:60px;height:60px;border-radius:50%;background:#5cb85c;display:flex;
+       align-items:center;justify-content:center;font-size:30px}
 </style></head>
 <body><div class="card">
   <h1>Alex <span class="badge">v2</span></h1>
-  <p class="sub">Paste a Google Meet link and Alex will join as AI assistant</p>
-  <input id="url" type="text" placeholder="https://meet.google.com/xxx-yyyy-zzz">
-  <button class="btn join" id="joinBtn" onclick="doJoin()">Join Meeting</button>
+  <p class="sub" id="subtitle">AI assistant for Google Meet</p>
+
+  <div id="joinArea">
+    <input id="url" type="text" placeholder="https://meet.google.com/xxx-yyyy-zzz">
+    <button class="btn join" id="joinBtn" onclick="doJoin()">Join Meeting</button>
+  </div>
+
+  <div class="big-spinner-wrap" id="spinnerArea">
+    <div class="big-spinner" id="bigSpinner"></div>
+    <div class="big-status" id="bigStatus">Connecting...</div>
+    <div class="big-sub" id="bigSub"></div>
+  </div>
+
   <button class="btn leave" id="leaveBtn" onclick="doLeave()" style="display:none">Leave Meeting</button>
-  <div class="status" id="st"><span class="dot idle"></span> Idle — waiting for a link</div>
+  <div class="status" id="st"></div>
   <button class="gcal" id="gcalBtn" onclick="connectCal()">Connect Google Calendar</button>
   <div class="stack">Deepgram STT + GPT-4o-mini + ElevenLabs TTS</div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
+
+function showSpinner(status, sub){
+  $('joinArea').style.display='none';
+  $('spinnerArea').style.display='flex';
+  $('bigStatus').textContent=status;
+  $('bigSub').textContent=sub||'';
+}
+function showActive(){
+  $('joinArea').style.display='none';
+  $('spinnerArea').style.display='flex';
+  $('bigSpinner').className='big-spinner active';
+  $('bigSpinner').innerHTML='<div class="check-icon">&#10003;</div>';
+  $('bigSpinner').style.border='none';
+  $('bigSpinner').style.width='auto';
+  $('bigSpinner').style.height='auto';
+  $('bigStatus').textContent='Alex is in the call';
+  $('bigSub').textContent='Listening and ready to help';
+}
+function showIdle(){
+  $('joinArea').style.display='block';
+  $('spinnerArea').style.display='none';
+  $('bigSpinner').className='big-spinner';
+  $('bigSpinner').innerHTML='';
+  $('bigSpinner').style.border='';
+  $('bigSpinner').style.width='';
+  $('bigSpinner').style.height='';
+  $('joinBtn').disabled=false;
+  $('joinBtn').innerHTML='Join Meeting';
+  $('leaveBtn').style.display='none';
+  $('subtitle').textContent='AI assistant for Google Meet';
+}
+
 async function doJoin(){
   const url = $('url').value.trim();
   if(!url){alert('Paste a Meet link first');return}
   $('joinBtn').disabled=true;
-  $('joinBtn').classList.add('loading');
-  $('joinBtn').innerHTML='<div class="circle-spinner"></div>';
-  $('st').innerHTML = '<span class="dot joining"></span> Sending bot to the meeting...';
+  showSpinner('Sending bot to the meeting...','This may take a few seconds');
   try{
     const r = await fetch('/join',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({meeting_url:url})});
     const d = await r.json();
-    if(d.error){alert(d.error);resetJoinBtn();return;}
-    $('joinBtn').innerHTML='<div class="circle-spinner"></div> Waiting for admit...';
+    if(d.error){alert(d.error);showIdle();return;}
     $('leaveBtn').style.display='flex';
     poll();
-  }catch(e){alert('Failed to connect');resetJoinBtn();}
-}
-function resetJoinBtn(){
-  $('joinBtn').disabled=false;
-  $('joinBtn').classList.remove('loading');
-  $('joinBtn').innerHTML='Join Meeting';
+  }catch(e){alert('Failed to connect');showIdle();}
 }
 async function doLeave(){
-  $('leaveBtn').innerHTML='<div class="circle-spinner"></div> Leaving...';
+  $('leaveBtn').innerHTML='Leaving...';
   $('leaveBtn').disabled=true;
+  showSpinner('Leaving the meeting...','');
   await fetch('/leave',{method:'POST'});
   poll();
 }
@@ -117,30 +154,30 @@ async function poll(){
   const r = await fetch('/status');
   const d = await r.json();
   const s = d.status||'idle';
-  const labels = {
-    idle:'Idle — waiting for a link',
-    joining:'Bot is joining... admit it in Google Meet',
-    in_call:'In the call — Alex is active',
-    leaving:'Leaving the meeting...'
-  };
-  $('st').innerHTML = '<span class="dot '+s+'"></span> '+(labels[s]||s);
   if(s==='idle'){
-    resetJoinBtn();
+    showIdle();
     $('leaveBtn').style.display='none';
     $('leaveBtn').innerHTML='Leave Meeting';
     $('leaveBtn').disabled=false;
   } else if(s==='joining'){
-    $('joinBtn').disabled=true;
-    $('joinBtn').classList.add('loading');
-    $('joinBtn').innerHTML='<div class="circle-spinner"></div> Waiting for admit...';
+    $('bigSpinner').className='big-spinner';
+    showSpinner('Connecting to the meeting...','Bot is being sent');
+    $('leaveBtn').style.display='flex';
+    setTimeout(poll, 1500);
+  } else if(s==='waiting_room'){
+    $('bigSpinner').className='big-spinner waiting';
+    showSpinner('Waiting to be admitted','Please admit Alex in Google Meet');
+    $('leaveBtn').style.display='flex';
     setTimeout(poll, 2000);
   } else if(s==='in_call'){
-    $('joinBtn').disabled=true;
-    $('joinBtn').classList.remove('loading');
-    $('joinBtn').innerHTML='Alex is in the call';
+    showActive();
     $('leaveBtn').innerHTML='Leave Meeting';
+    $('leaveBtn').style.display='flex';
     $('leaveBtn').disabled=false;
     setTimeout(poll, 3000);
+  } else if(s==='leaving'){
+    showSpinner('Leaving the meeting...','');
+    setTimeout(poll, 2000);
   } else {
     setTimeout(poll, 2000);
   }
@@ -152,7 +189,7 @@ function connectCal(){
     const d=await r.json();
     if(d.connected){
       clearInterval(ci);
-      $('gcalBtn').innerHTML='✓ Connected! You can close this.';
+      $('gcalBtn').innerHTML='Connected to Google Calendar';
       setTimeout(()=>{$('gcalBtn').innerHTML='Connect Google Calendar';},5000);
     }
   },2000);
@@ -162,7 +199,7 @@ function connectCal(){
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return _HTML
+    return HTMLResponse(content=_HTML, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.get("/health")
